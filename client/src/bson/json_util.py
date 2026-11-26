@@ -30,7 +30,13 @@ def _hook(obj):
     if set(obj) == {"$oid"}: return ObjectId(obj["$oid"])
     if set(obj) == {"$date"}:
         date = obj["$date"]
-        millis = int(date["$numberLong"] if isinstance(date, dict) else date)
+        if isinstance(date, dict):
+            millis = int(date["$numberLong"])
+        elif isinstance(date, str):
+            parsed = datetime.fromisoformat(date.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        else:
+            millis = int(date)
         return datetime.fromtimestamp(millis / 1000, timezone.utc)
     if set(obj) == {"$numberInt"}: return int(obj["$numberInt"])
     if set(obj) == {"$numberLong"}: return int(obj["$numberLong"])

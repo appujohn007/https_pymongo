@@ -19,6 +19,11 @@ def test_extended_json_round_trip_objectid():
     assert json_util.loads(json_util.dumps(value)) == value
 
 
+def test_extended_json_reads_relaxed_iso_dates_from_official_pymongo():
+    value = json_util.loads('{"created":{"$date":"2026-11-26T12:34:56.789Z"}}')
+    assert value["created"].isoformat() == "2026-11-26T12:34:56.789000+00:00"
+
+
 def test_motor_passes_uri_and_query_over_https_without_api_key(monkeypatch):
     import httpx
     requests = []
