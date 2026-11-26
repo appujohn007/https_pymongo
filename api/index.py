@@ -9,6 +9,8 @@ from collections import OrderedDict
 from contextlib import contextmanager
 import hashlib
 import json
+import difflib
+import re
 import threading
 import time
 
@@ -33,6 +35,40 @@ _CURSOR_OPTIONS = {"skip", "limit", "sort", "batch_size", "hint", "comment", "ma
 
 class ResponseTooLarge(Exception):
     pass
+
+
+class UnsupportedMethodError(ValueError):
+    pass
+
+
+_BULK_OPERATION_TYPES = {
+    "InsertOne", "UpdateOne", "UpdateMany", "ReplaceOne", "DeleteOne", "DeleteMany",
+}
+_STATEFUL_METHODS = {"start_session", "watch"}
+_BRIDGE_INTERNAL_METHODS = {"close", "next"}
+_UNSUPPORTED_CONFIGURATION_METHODS = {"with_options", "append_metadata"}
+
+
+def _decode_operations(value):
+    """Rebuild official PyMongo operation objects from the wire representation."""
+    if isinstance(value, list):
+        return [_decode_operations(item) for item in value]
+    if isinstance(value, dict):
+        kind = value.get("__https_pymongo_operation__")
+        if kind:
+            if kind not in _BULK_OPERATION_TYPES:
+                raise ValueError(f"Unsupported bulk write operation: {kind}")
+            from pymongo import operations
+            operation = getattr(operations, kind)
+            if kind == "InsertOne":
+                return operation(value.get("document"), namespace=value.get("namespace"))
+            return operation(value.get("filter"), *value.get("args", ()), namespace=value.get("namespace"), **value.get("kwargs", {}))
+        return {key: _decode_operations(item) for key, item in value.items()}
+    return value
+
+
+def _public_callables(receiver):
+    return {name for name in dir(type(receiver)) if not name.startswith("_") and callable(getattr(type(receiver), name, None))}
 
 
 def _validate_uri(uri):
@@ -174,6 +210,7 @@ def _pack(value, metrics=None):
     result_types = {
         "InsertOneResult": "InsertOneResult", "InsertManyResult": "InsertManyResult",
         "UpdateResult": "UpdateResult", "DeleteResult": "DeleteResult",
+        "BulkWriteResult": "BulkWriteResult", "ClientBulkWriteResult": "ClientBulkWriteResult",
     }
     if name in result_types:
         fields = {
@@ -181,6 +218,8 @@ def _pack(value, metrics=None):
             "InsertManyResult": ("inserted_ids",),
             "UpdateResult": ("matched_count", "modified_count", "upserted_id", "raw_result"),
             "DeleteResult": ("deleted_count",),
+        "BulkWriteResult": ("inserted_count", "matched_count", "modified_count", "deleted_count", "upserted_count", "upserted_ids", "bulk_api_result"),
+        "ClientBulkWriteResult": ("inserted_count", "matched_count", "modified_count", "deleted_count", "upserted_count", "bulk_api_result", "has_verbose_results", "insert_results", "update_results", "delete_results"),
         }[name]
         payload = {field: getattr(value, field, None) for field in fields}
         return {"__https_pymongo_result__": result_types[name], "value": payload}
@@ -191,9 +230,17 @@ def _pack(value, metrics=None):
 
 
 def _run(data, metrics=None):
+    if not isinstance(data, dict):
+        raise ValueError("Request body must be a JSON object")
     uri = data.get("uri")
     _validate_uri(uri)
     target = data.get("target")
+    if target not in {"client", "database", "collection"}:
+        raise ValueError("Unknown operation target; expected client, database, or collection")
+    if target in {"database", "collection"} and not isinstance(data.get("database"), str):
+        raise ValueError("database must be a string for this operation target")
+    if target == "collection" and not isinstance(data.get("collection"), str):
+        raise ValueError("collection must be a string for this operation target")
     method_name = data.get("method")
     if not isinstance(method_name, str) or not method_name or method_name.startswith("_"):
         raise ValueError("A public method name is required")
@@ -207,6 +254,8 @@ def _run(data, metrics=None):
     kwargs = data.get("kwargs") or {}
     if not isinstance(args, list) or not isinstance(kwargs, dict):
         raise ValueError("args must be an array and kwargs must be an object")
+    args = _decode_operations(args)
+    kwargs = _decode_operations(kwargs)
     cache_started = time.perf_counter()
     with _client_lease(uri, options) as lease:
         client, cache_status = lease
@@ -220,7 +269,18 @@ def _run(data, metrics=None):
         elif target == "collection":
             receiver = client[data["database"]][data["collection"]]
         else:
-            raise ValueError("Unknown operation target")
+            raise ValueError("Unknown operation target; expected client, database, or collection")
+        supported = _public_callables(receiver)
+        if method_name not in supported:
+            choices = difflib.get_close_matches(method_name, sorted(supported), n=3, cutoff=0.45)
+            suffix = f" Similar supported methods: {', '.join(choices)}." if choices else ""
+            raise UnsupportedMethodError(f"Unsupported {target} method '{method_name}'. This API bridge supports callable methods exposed by the installed PyMongo version.{suffix}")
+        if method_name in _STATEFUL_METHODS:
+            raise UnsupportedMethodError(f"'{target}.{method_name}' is unavailable through this stateless HTTPS bridge because it requires a persistent MongoDB session or change stream. Use direct PyMongo for sessions, transactions, and change streams.")
+        if method_name in _BRIDGE_INTERNAL_METHODS:
+            raise UnsupportedMethodError(f"'{target}.{method_name}' is a driver lifecycle/iteration method and cannot be invoked as a remote database operation.")
+        if method_name in _UNSUPPORTED_CONFIGURATION_METHODS:
+            raise UnsupportedMethodError(f"'{target}.{method_name}' changes local driver configuration, which this stateless HTTP facade does not preserve. Pass supported connection options to MongoClient instead.")
         method = getattr(receiver, method_name)
         if not callable(method):
             raise ValueError("Requested member is not callable")
@@ -300,9 +360,20 @@ class handler(BaseHTTPRequestHandler):
             metrics["error_type"] = type(exc).__name__
             envelope = {"ok": False, "error": str(exc), "type": type(exc).__name__}
         except Exception as exc:
-            status = 502
+            from pymongo.errors import (DuplicateKeyError, ConfigurationError, ConnectionFailure,
+                ServerSelectionTimeoutError, OperationFailure)
+            status = 503 if isinstance(exc, (ConnectionFailure, ServerSelectionTimeoutError)) else 409 if isinstance(exc, DuplicateKeyError) else 400 if isinstance(exc, (ConfigurationError, OperationFailure)) else 502
             metrics["error_type"] = type(exc).__name__
-            envelope = {"ok": False, "error": str(exc), "type": type(exc).__name__}
+            message = str(exc)
+            # Mongo drivers can include credentials in URI diagnostics. Keep those private.
+            message = re.sub(r"mongodb(?:\+srv)?://[^\s'\"]+", "<MongoDB URI>", message, flags=re.IGNORECASE)
+            error = {"ok": False, "error": message, "type": type(exc).__name__}
+            code = getattr(exc, "code", None)
+            if isinstance(code, int): error["code"] = code
+            details = getattr(exc, "details", None)
+            if isinstance(details, dict):
+                error["details"] = details
+            envelope = error
         try:
             status, response_bytes = self._reply(status, envelope, metrics)
             metrics["status"] = status

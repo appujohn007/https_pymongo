@@ -6,6 +6,10 @@ Fluid Compute is enabled in `vercel.json`; the function duration is set to the H
 
 Each POST emits one structured `https_pymongo_metrics` log line with request/response byte counts, total time, cache hit/miss/transient status, client lookup time, database-call time, cursor read time, packing/encoding time, and returned document count. It never logs the URI, filters, collection/database names, or document contents.
 
+The bridge accepts callable public client, database, and collection methods from the installed PyMongo release, including CRUD, aggregation, index methods, and collection/client bulk writes. Bulk operation markers are decoded to official PyMongo operation objects. Unknown methods return an informative 400 response with close matches. MongoDB failures return structured error types and numeric codes where available; duplicate keys use HTTP 409, connectivity failures use 503, and other operation errors use 400/502 as appropriate. Sessions, transactions, change streams, and driver lifecycle methods are rejected because one HTTPS request cannot preserve their state.
+
+Request and response bodies are each limited to 4 MB. Cursor results are materialized into a single response, so large result sets require caller-side filters/limits and cannot be streamed through this protocol.
+
 This endpoint is intentionally public and unauthenticated. Anyone can submit a URI, so use HTTPS and narrowly permissioned MongoDB accounts. Do not log request bodies or publish credentials. Cached clients are limited to eight per warm instance, with small connection pools, to limit connection growth from arbitrary caller URIs.
 
 

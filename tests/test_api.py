@@ -49,6 +49,27 @@ def test_uri_and_generic_cursor_call_are_forwarded(monkeypatch):
     index._clear_client_cache()
 
 
+def test_unknown_method_has_informative_unsupported_error(monkeypatch):
+    index._clear_client_cache()
+    global db
+    db=Database(Collection())
+    monkeypatch.setattr(index,"MongoClient",lambda uri, **options: Client(uri,**options))
+    with pytest.raises(index.UnsupportedMethodError, match="Unsupported collection method 'fnd'"):
+        index._run({"uri":"mongodb://example", "target":"collection", "database":"app",
+            "collection":"users", "method":"fnd", "args":[], "kwargs":{}})
+    index._clear_client_cache()
+
+
+def test_bulk_write_marker_becomes_official_pymongo_operation():
+    from pymongo.operations import InsertOne, UpdateOne
+    decoded=index._decode_operations([{"__https_pymongo_operation__":"InsertOne", "document":{"x":1}},
+        {"__https_pymongo_operation__":"UpdateOne", "filter":{"x":1}, "args":[{"$set":{"y":2}}],
+         "kwargs":{"upsert":True}, "namespace":"app.items"}])
+    assert isinstance(decoded[0], InsertOne)
+    assert isinstance(decoded[1], UpdateOne)
+    assert decoded[1]._namespace == "app.items"
+
+
 def test_client_pool_is_reused_and_lru_is_bounded(monkeypatch):
     index._clear_client_cache()
     global db
