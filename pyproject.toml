@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pymongo"
+name = "https-pymongo"
 version = "0.1.0"
-description = "A small PyMongo and Motor-shaped client that sends operations over HTTPS"
+description = "PyMongo and Motor compatible client facade that sends database calls over HTTPS"
 requires-python = ">=3.9"
 
 [tool.setuptools.packages.find]

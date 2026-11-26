@@ -1,27 +1,30 @@
-﻿# https-pymongo
+# HTTPS PyMongo
 
-This package provides the import names `pymongo`, `motor.motor_asyncio`, and `bson` for an HTTPS-backed subset of PyMongo/Motor. The initial compatibility target is the supplied `Database` class: async collection selection, `find_one`, `find`, cursor paging/sorting/iteration, counts, inserts, updates, deletes, and ObjectId.
+The PACKAGE branch installs a distribution named `https-pymongo` while exposing the familiar `pymongo`, `motor.motor_asyncio`, and `bson` imports. It sends operations to the public API at `https://httpspymongo.vercel.app/api`.
 
-It is not full PyMongo parity. It does not yet support sessions/transactions, change streams, GridFS, aggregation, bulk writes, connection pooling, or every option/error class. Each request goes to one configured Atlas account; keep the API key private.
+## Install in a project
 
-## Configure the server
-
-On the Vercel project connected to the **API** branch, set these server environment variables and redeploy:
-
-- `MONGODB_URI`: Atlas connection string, held only by the server.
-- `HTTPS_PYMONGO_API_KEY`: a long random shared secret.
-
-The API branch contains only the Vercel handler, so its `pymongo` import resolves to the real PyMongo dependency. The client package is under `client/src` on PACKAGE and does not shadow the server dependency.
-
-## Configure the app
-
-Install this repository's PACKAGE branch in the app environment, then set:
+Run this in the project's virtual environment. The first command removes the official PyMongo and Motor packages because this project provides those import names:
 
 ```powershell
-$env:HTTPS_PYMONGO_API_KEY = "the same secret configured in Vercel"
-$env:HTTPS_PYMONGO_API_URL = "https://httpspymongo.vercel.app/api" # optional
+python -m pip uninstall -y pymongo motor
+python -m pip install git+https://github.com/appujohn007/https_pymongo.git@PACKAGE
 ```
 
-The app can keep its imports and `AsyncIOMotorClient(uri)` calls unchanged. The passed Mongo URI is deliberately never transmitted; the server-side `MONGODB_URI` chooses the Atlas account. The supplied URI has no database path, and its embedded database credentials must be moved into Vercel's secret settings before deployment.
+Then existing code can continue to use the URI it already passes to the client:
 
-Supported API operations: `find_one`, `find`, `count_documents`, `insert_one`, `insert_many`, `delete_one`, `delete_many`, `update_one`, `update_many`, `replace_one`, and `distinct`. Cursors support `skip`, `limit`, `sort`, `to_list`, and `async for`.
+```python
+import pymongo
+import motor.motor_asyncio
+
+client = pymongo.MongoClient("mongodb+srv://user:password@cluster.example/")
+db = client["my_database"]
+```
+
+The URI is sent to the API in each HTTPS request. The API does not use a fixed `MONGODB_URI` setting and does not require a shared API key.
+
+## API design and limits
+
+The API is an unauthenticated bridge by design. It accepts the caller's MongoDB URI, target, method, and arguments, executes the call with the official PyMongo driver, and returns the result using Extended JSON. Use HTTPS and database credentials with only the permissions the app needs. The API does not intentionally persist or log request bodies.
+
+The client forwards common synchronous PyMongo calls dynamically and provides async wrappers for Motor-style calls. Cursor-returning calls are materialized by the API and sent back as document lists. This keeps typical CRUD, collection, database, and query code familiar, but stateless HTTP cannot reproduce every PyMongo behavior: sessions and multi-call transactions, change streams, tailable cursors, client-side connection pooling, and unbounded/live server cursors are not equivalent. This package is not yet complete PyMongo/Motor parity.

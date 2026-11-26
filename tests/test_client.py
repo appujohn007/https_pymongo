@@ -3,7 +3,7 @@ import json
 
 from bson import ObjectId, json_util
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo import DESCENDING
+from pymongo import DESCENDING, MongoClient
 
 
 class FakeResponse:
@@ -18,21 +18,38 @@ def test_extended_json_round_trip_objectid():
     assert json_util.loads(json_util.dumps(value)) == value
 
 
-def test_async_motor_calls_preserve_database_collection_and_query(monkeypatch):
+def test_motor_passes_uri_and_query_over_https_without_api_key(monkeypatch):
     import pymongo.mongo_client as http_client
-    calls = []
+    requests = []
     def fake_urlopen(request, timeout):
-        calls.append(json.loads(request.data))
+        requests.append(request)
         return FakeResponse([{"ok": 1}])
-    monkeypatch.setenv("HTTPS_PYMONGO_API_KEY", "test-key")
     monkeypatch.setattr(http_client.urllib.request, "urlopen", fake_urlopen)
     async def run():
-        client = AsyncIOMotorClient("mongodb://must-not-be-sent")
+        client = AsyncIOMotorClient("mongodb+srv://account:secret@cluster.example/")
         cursor = client["app"]["users"].find({"active": True}).sort("_id", DESCENDING).skip(1).limit(2)
-        rows = await cursor.to_list(length=1)
-        assert rows == [{"ok": 1}]
+        assert await cursor.to_list(length=1) == [{"ok": 1}]
     asyncio.run(run())
-    assert calls[0]["database"] == "app"
-    assert calls[0]["collection"] == "users"
-    assert calls[0]["args"] == {"filter": {"active": True}, "projection": None, "skip": 1, "limit": 2, "sort": [["_id", -1]]}
-    assert "must-not-be-sent" not in json.dumps(calls)
+    payload = json.loads(requests[0].data)
+    assert payload["uri"] == "mongodb+srv://account:secret@cluster.example/"
+    assert payload["target"] == "collection"
+    assert payload["method"] == "find"
+    assert payload["database"] == "app"
+    assert payload["collection"] == "users"
+    assert payload["args"] == [{"active": True}]
+    assert payload["cursor"] == {"sort": [["_id", -1]], "skip": 1, "limit": 2}
+    assert "Authorization" not in requests[0].header_items()
+
+
+def test_sync_generic_methods_preserve_arguments(monkeypatch):
+    import pymongo.mongo_client as http_client
+    captured = []
+    def fake_urlopen(request, timeout):
+        captured.append(json.loads(request.data))
+        return FakeResponse({"ok": 3})
+    monkeypatch.setattr(http_client.urllib.request, "urlopen", fake_urlopen)
+    client = MongoClient("mongodb://user:pw@host/db")
+    assert client.db.users.find_one({"id": 7}, {"_id": 0}) == {"ok": 3}
+    assert captured[0]["uri"] == "mongodb://user:pw@host/db"
+    assert captured[0]["method"] == "find_one"
+    assert captured[0]["args"] == [{"id": 7}, {"_id": 0}]
