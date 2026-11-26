@@ -116,6 +116,29 @@ def test_read_only_call_retries_one_dropped_response(monkeypatch):
     client.close()
 
 
+def test_motor_database_attribute_access_resolves_collections(monkeypatch):
+    import httpx
+    from motor.motor_asyncio import AsyncIOMotorCollection, AsyncIOMotorDatabase
+    captured = []
+    def fake_post(self, url, **kwargs):
+        captured.append(json.loads(kwargs["content"]))
+        return FakeResponse({"ok": True, "result": {"found": True}})
+    monkeypatch.setattr(httpx.Client, "post", fake_post)
+    async def run():
+        client = AsyncIOMotorClient("mongodb://host")
+        database = client.app
+        collection = database.blacklist
+        assert isinstance(database, AsyncIOMotorDatabase)
+        assert isinstance(collection, AsyncIOMotorCollection)
+        assert await collection.find_one({"id": 9}) == {"found": True}
+        client.close()
+    asyncio.run(run())
+    assert captured[0]["target"] == "collection"
+    assert captured[0]["database"] == "app"
+    assert captured[0]["collection"] == "blacklist"
+    assert captured[0]["method"] == "find_one"
+
+
 def test_bridge_errors_map_to_informative_pymongo_errors():
     from pymongo.errors import DuplicateKeyError, UnsupportedOperation
     from pymongo.mongo_client import _remote_error

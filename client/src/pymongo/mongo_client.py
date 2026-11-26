@@ -124,7 +124,9 @@ class Database:
     def __getattr__(self, method):
         if method.startswith("_"): raise AttributeError(method)
         if method in _DATABASE_METHODS:
-            if method in _DATABASE_CURSOR_METHODS: return SyncCursor(self, method, (), {})
+            if method in _DATABASE_CURSOR_METHODS:
+                def cursor(*args, **kwargs): return SyncCursor(self, method, args, kwargs)
+                return cursor
             def call(*args, **kwargs): return self.client._request("database", self.name, method=method, args=args, kwargs=kwargs)
             return call
         return self[method]

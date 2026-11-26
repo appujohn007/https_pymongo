@@ -1,8 +1,17 @@
 """Async Motor-shaped wrappers over the HTTPS PyMongo client."""
 import asyncio
 
-from pymongo.mongo_client import (MongoClient, SyncCursor, _CLIENT_CURSOR_METHODS,
-                                  _CURSOR_METHODS, _DATABASE_CURSOR_METHODS)
+from pymongo.mongo_client import (MongoClient, Database as SyncDatabase,
+                                  Collection as SyncCollection, SyncCursor,
+                                  _CLIENT_CURSOR_METHODS, _CURSOR_METHODS,
+                                  _DATABASE_CURSOR_METHODS)
+
+
+def _wrap(value):
+    if isinstance(value, SyncDatabase): return AsyncIOMotorDatabase(value)
+    if isinstance(value, SyncCollection): return AsyncIOMotorCollection(value)
+    if isinstance(value, SyncCursor): return AsyncIOMotorCursor(value)
+    return value
 
 
 class AsyncIOMotorClient:
@@ -20,10 +29,13 @@ class AsyncIOMotorClient:
     def __exit__(self, *exc): self.close()
     def __getattr__(self, method):
         if method.startswith("_"): raise AttributeError(method)
+        value = getattr(self._sync, method)
+        if isinstance(value, SyncDatabase): return AsyncIOMotorDatabase(value)
+        if not callable(value): return _wrap(value)
         if method in _CLIENT_CURSOR_METHODS:
-            def cursor(*args, **kwargs): return AsyncIOMotorCursor(getattr(self._sync, method)(*args, **kwargs))
+            def cursor(*args, **kwargs): return _wrap(value(*args, **kwargs))
             return cursor
-        async def call(*args, **kwargs): return await asyncio.to_thread(getattr(self._sync, method), *args, **kwargs)
+        async def call(*args, **kwargs): return _wrap(await asyncio.to_thread(value, *args, **kwargs))
         return call
 
 
@@ -33,10 +45,13 @@ class AsyncIOMotorDatabase:
     def get_collection(self, name, **kwargs): return self[name]
     def __getattr__(self, method):
         if method.startswith("_"): raise AttributeError(method)
+        value = getattr(self._sync, method)
+        if isinstance(value, SyncCollection): return AsyncIOMotorCollection(value)
+        if not callable(value): return _wrap(value)
         if method in _DATABASE_CURSOR_METHODS:
-            def cursor(*args, **kwargs): return AsyncIOMotorCursor(getattr(self._sync, method)(*args, **kwargs))
+            def cursor(*args, **kwargs): return _wrap(value(*args, **kwargs))
             return cursor
-        async def call(*args, **kwargs): return await asyncio.to_thread(getattr(self._sync, method), *args, **kwargs)
+        async def call(*args, **kwargs): return _wrap(await asyncio.to_thread(value, *args, **kwargs))
         return call
 
 
@@ -48,8 +63,11 @@ class AsyncIOMotorCollection:
     def __getattr__(self, method):
         if method.startswith("_"): raise AttributeError(method)
         fn = getattr(self._sync, method)
-        if method in _CURSOR_METHODS: return AsyncIOMotorCursor(fn)
-        async def call(*args, **kwargs): return await asyncio.to_thread(fn, *args, **kwargs)
+        if not callable(fn): return _wrap(fn)
+        if method in _CURSOR_METHODS:
+            def cursor(*args, **kwargs): return _wrap(fn(*args, **kwargs))
+            return cursor
+        async def call(*args, **kwargs): return _wrap(await asyncio.to_thread(fn, *args, **kwargs))
         return call
 
 
