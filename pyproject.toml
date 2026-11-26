@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pymongo"
+version = "0.1.0"
+description = "A small PyMongo and Motor-shaped client that sends operations over HTTPS"
+requires-python = ">=3.9"
+
+[tool.setuptools.packages.find]
+where = ["client/src"]
+include = ["pymongo*", "motor*", "bson*"]
+
+[tool.setuptools.package-dir]
+"" = "client/src"
