@@ -11,6 +11,7 @@ class FakeResponse:
         self.content = json_util.dumps(value).encode()
         self.status_code = status_code
         self.is_error = status_code >= 400
+        self.headers = {"content-type": "application/json"}
 
 
 def test_extended_json_round_trip_objectid():
@@ -93,6 +94,20 @@ def test_bulk_write_result_is_decoded_to_result_object(monkeypatch):
     client = MongoClient("mongodb://host")
     result = client.bulk_write([])
     assert result.inserted_count == 1 and result.acknowledged
+    client.close()
+
+
+def test_read_only_call_retries_one_dropped_response(monkeypatch):
+    import httpx
+    attempts = []
+    def fake_post(self, url, **kwargs):
+        attempts.append(url)
+        if len(attempts) == 1: raise httpx.ReadError("stale keep-alive connection")
+        return FakeResponse({"ok": True, "result": {"n": 4}})
+    monkeypatch.setattr(httpx.Client, "post", fake_post)
+    client = MongoClient("mongodb://host")
+    assert client.db.items.count_documents({}) == {"n": 4}
+    assert len(attempts) == 2
     client.close()
 
 

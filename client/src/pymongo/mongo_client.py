@@ -12,6 +12,11 @@ _CLIENT_CURSOR_METHODS = {"list_databases"}
 _CLIENT_METHODS = {"list_database_names", "list_databases", "drop_database", "watch", "start_session", "server_info", "bulk_write", "append_metadata"}
 _DATABASE_CURSOR_METHODS = {"aggregate", "list_collections"}
 _DATABASE_METHODS = {"command", "list_collection_names", "list_collections", "create_collection", "drop_collection", "dereference", "watch", "validate_collection", "aggregate", "cursor_command", "with_options"}
+_RETRYABLE_READS = {
+    "list_database_names", "list_databases", "list_collection_names", "list_collections",
+    "find", "find_one", "count_documents", "estimated_document_count", "distinct",
+    "list_indexes", "list_search_indexes", "index_information", "options", "server_info",
+}
 _CLIENT_OPTIONS = {
     "appname", "authsource", "authmechanism", "tls", "ssl", "replicaset", "directconnection",
     "serverselectiontimeoutms", "connecttimeoutms", "sockettimeoutms", "retrywrites",
@@ -70,21 +75,25 @@ class MongoClient:
             "client_options": self._client_options,
         }
         body = json_util.dumps(request_data).encode("utf-8")
-        try:
-            response = self._http.post(self.api_url, content=body, headers={"Content-Type": "application/json"})
+        can_retry_read = method in _RETRYABLE_READS and target in {"client", "database", "collection"}
+        response = envelope = None
+        for attempt in range(2 if can_retry_read else 1):
+            try:
+                response = self._http.post(self.api_url, content=body, headers={"Content-Type": "application/json"})
+            except (httpx.ReadError, httpx.RemoteProtocolError) as exc:
+                if can_retry_read and attempt == 0:
+                    continue
+                raise ConnectionFailure(f"HTTPS API transport failed ({type(exc).__name__}): {exc}", timeout=isinstance(exc, httpx.TimeoutException)) from exc
+            except httpx.HTTPError as exc:
+                raise ConnectionFailure(f"HTTPS API transport failed ({type(exc).__name__}): {exc}", timeout=isinstance(exc, httpx.TimeoutException)) from exc
             try:
                 envelope = json_util.loads(response.content.decode("utf-8"))
             except (UnicodeDecodeError, ValueError) as exc:
-                raise OperationFailure(f"HTTPS bridge returned a non-JSON response (HTTP {response.status_code}); verify the API URL and deployment") from exc
-        except httpx.HTTPStatusError as exc:
-            response = exc.response
-            try:
-                detail = json_util.loads(response.content.decode("utf-8"))
-            except Exception:
-                detail = {"error": f"HTTPS bridge returned HTTP {response.status_code}", "type": "OperationFailure"}
-            raise _remote_error(detail, response.status_code) from exc
-        except httpx.HTTPError as exc:
-            raise ConnectionFailure(f"HTTPS API transport failed ({type(exc).__name__}): {exc}", timeout=isinstance(exc, httpx.TimeoutException)) from exc
+                if can_retry_read and attempt == 0:
+                    continue
+                content_type = response.headers.get("content-type", "unknown")
+                raise OperationFailure(f"HTTPS bridge returned a non-JSON response (HTTP {response.status_code}, content-type {content_type}, {len(response.content)} bytes); verify the API URL and deployment") from exc
+            break
         if response.is_error:
             raise _remote_error(envelope, response.status_code)
         if not envelope.get("ok"):
