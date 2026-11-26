@@ -92,7 +92,13 @@ class MongoClient:
                 if can_retry_read and attempt == 0:
                     continue
                 content_type = response.headers.get("content-type", "unknown")
-                raise OperationFailure(f"HTTPS bridge returned a non-JSON response (HTTP {response.status_code}, content-type {content_type}, {len(response.content)} bytes); verify the API URL and deployment") from exc
+                try:
+                    standard_json = json_util.json.loads(response.content.decode("utf-8"))
+                    shape = f"valid JSON ({type(standard_json).__name__})"
+                    if isinstance(standard_json, dict): shape += f" with fields {', '.join(sorted(standard_json.keys())[:12])}"
+                except Exception:
+                    shape = "invalid JSON"
+                raise OperationFailure(f"HTTPS bridge response decoding failed: {shape}; HTTP {response.status_code}, content-type {content_type}, {len(response.content)} bytes. Check API/client codec compatibility or deployment health") from exc
             break
         if response.is_error:
             raise _remote_error(envelope, response.status_code)
