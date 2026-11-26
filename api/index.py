@@ -31,6 +31,10 @@ _CLIENT_OPTION_NAMES = {
 _CURSOR_OPTIONS = {"skip", "limit", "sort", "batch_size", "hint", "comment", "max_time_ms", "collation"}
 
 
+class ResponseTooLarge(Exception):
+    pass
+
+
 def _validate_uri(uri):
     if not isinstance(uri, str):
         raise ValueError("A MongoDB URI is required")
@@ -140,7 +144,15 @@ def _pack(value):
     if name == "Collection":
         return {"__https_pymongo_object__": "Collection", "database": value.database.name, "name": value.name}
     if name in ("Cursor", "CommandCursor", "RawBatchCursor", "SearchIndexCursor"):
-        return [_pack(item) for item in value]
+        items = []
+        estimated_bytes = 2
+        for item in value:
+            packed = _pack(item)
+            estimated_bytes += len(json_util.dumps(packed).encode("utf-8")) + 1
+            if estimated_bytes > _MAX_RESPONSE_BYTES - 512:
+                raise ResponseTooLarge("Cursor result exceeds the HTTPS response limit; apply a smaller limit")
+            items.append(packed)
+        return items
     result_types = {
         "InsertOneResult": "InsertOneResult", "InsertManyResult": "InsertManyResult",
         "UpdateResult": "UpdateResult", "DeleteResult": "DeleteResult",
@@ -195,7 +207,7 @@ def _run(data):
             for option, value in cursor_options.items():
                 if option in _CURSOR_OPTIONS and value is not None:
                     getattr(result, option)(value)
-            result = list(result)
+            return _pack(result)
         return _pack(result)
 
 
@@ -222,6 +234,8 @@ class handler(BaseHTTPRequestHandler):
                 return
             data = json_util.loads(self.rfile.read(length))
             self._reply(200, {"ok": True, "result": _run(data)})
+        except ResponseTooLarge as exc:
+            self._reply(413, {"ok": False, "error": str(exc), "type": type(exc).__name__})
         except (KeyError, TypeError, ValueError) as exc:
             self._reply(400, {"ok": False, "error": str(exc), "type": type(exc).__name__})
         except Exception as exc:
