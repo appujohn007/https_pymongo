@@ -1,66 +1,97 @@
-"""Vercel serverless MongoDB HTTP bridge. Configure MONGODB_URI and HTTPS_PYMONGO_API_KEY."""
+"""Public HTTPS RPC bridge for PyMongo-compatible clients.
+
+This endpoint intentionally has no shared API key and no fixed Atlas URI. The caller's
+MongoDB URI is sent over HTTPS with each operation and used only for that operation.
+"""
 from http.server import BaseHTTPRequestHandler
-import hmac
+from urllib.parse import urlsplit
 import json
-import os
-import threading
 
 from bson import json_util
 from pymongo import MongoClient
 
-_client = None
-_lock = threading.Lock()
+_MAX_REQUEST_BYTES = 2_000_000
+_CLIENT_OPTION_NAMES = {
+    "appname", "authsource", "authmechanism", "tls", "ssl", "replicaset", "directconnection",
+    "serverselectiontimeoutms", "connecttimeoutms", "sockettimeoutms", "retrywrites", "retryreads",
+    "readpreference", "w", "wtimeoutms", "journal", "compressors",
+}
+_CURSOR_OPTIONS = {"skip", "limit", "sort", "batch_size", "hint", "comment", "max_time_ms", "collation"}
 
 
-def _mongo():
-    global _client
-    if _client is None:
-        with _lock:
-            if _client is None:
-                uri = os.environ.get("MONGODB_URI")
-                if not uri:
-                    raise RuntimeError("MONGODB_URI is not configured")
-                _client = MongoClient(uri, serverSelectionTimeoutMS=8000)
-    return _client
+def _validate_uri(uri):
+    if not isinstance(uri, str):
+        raise ValueError("A MongoDB URI is required")
+    scheme = urlsplit(uri).scheme.lower()
+    if scheme not in ("mongodb", "mongodb+srv"):
+        raise ValueError("URI must use mongodb:// or mongodb+srv://")
+
+
+def _pack(value):
+    """Convert PyMongo cursors and result objects into Extended-JSON-safe values."""
+    name = type(value).__name__
+    if name == "Database":
+        return {"__https_pymongo_object__": "Database", "name": value.name}
+    if name == "Collection":
+        return {"__https_pymongo_object__": "Collection", "database": value.database.name, "name": value.name}
+    if name in ("Cursor", "CommandCursor", "RawBatchCursor", "SearchIndexCursor"):
+        return [_pack(item) for item in value]
+    result_types = {
+        "InsertOneResult": "InsertOneResult", "InsertManyResult": "InsertManyResult",
+        "UpdateResult": "UpdateResult", "DeleteResult": "DeleteResult",
+    }
+    if name in result_types:
+        fields = {
+            "InsertOneResult": ("inserted_id",),
+            "InsertManyResult": ("inserted_ids",),
+            "UpdateResult": ("matched_count", "modified_count", "upserted_id", "raw_result"),
+            "DeleteResult": ("deleted_count",),
+        }[name]
+        payload = {field: getattr(value, field, None) for field in fields}
+        return {"__https_pymongo_result__": result_types[name], "value": payload}
+    if isinstance(value, tuple): return [_pack(item) for item in value]
+    if isinstance(value, list): return [_pack(item) for item in value]
+    if isinstance(value, dict): return {key: _pack(item) for key, item in value.items()}
+    return value
 
 
 def _run(data):
-    action = data["action"]
-    db = _mongo()[data["database"]]
-    if action == "ping":
-        return db.command("ping")
-    col = db[data["collection"]]
-    args = data.get("args", {})
-    if action == "find_one": return col.find_one(args.get("filter", {}), args.get("projection"))
-    if action == "find":
-        cursor = col.find(args.get("filter", {}), args.get("projection"))
-        if args.get("sort"): cursor.sort(args["sort"])
-        if args.get("skip"): cursor.skip(args["skip"])
-        if args.get("limit"): cursor.limit(args["limit"])
-        return list(cursor)
-    if action == "count_documents": return col.count_documents(args.get("filter", {}), **args.get("options", {}))
-    if action == "insert_one": return {"inserted_id": col.insert_one(args["document"]).inserted_id}
-    if action == "insert_many": return {"inserted_ids": col.insert_many(args["documents"], ordered=args.get("ordered", True)).inserted_ids}
-    if action == "delete_one":
-        r = col.delete_one(args.get("filter", {})); return {"deleted_count": r.deleted_count}
-    if action == "delete_many":
-        r = col.delete_many(args.get("filter", {})); return {"deleted_count": r.deleted_count}
-    if action == "update_one":
-        r = col.update_one(args["filter"], args["update"], upsert=args.get("upsert", False))
-        return {"matched_count": r.matched_count, "modified_count": r.modified_count, "upserted_id": r.upserted_id}
-    if action == "update_many":
-        r = col.update_many(args["filter"], args["update"], upsert=args.get("upsert", False))
-        return {"matched_count": r.matched_count, "modified_count": r.modified_count, "upserted_id": r.upserted_id}
-    if action == "replace_one":
-        r = col.replace_one(args["filter"], args["replacement"], upsert=args.get("upsert", False))
-        return {"matched_count": r.matched_count, "modified_count": r.modified_count, "upserted_id": r.upserted_id}
-    if action == "distinct": return col.distinct(args["key"], args.get("filter", {}))
-    raise ValueError("Unsupported action")
+    uri = data.get("uri")
+    _validate_uri(uri)
+    target = data.get("target")
+    method_name = data.get("method")
+    if not isinstance(method_name, str) or not method_name or method_name.startswith("_"):
+        raise ValueError("A public method name is required")
+    options = data.get("client_options") or {}
+    options = {key: value for key, value in options.items() if key.lower() in _CLIENT_OPTION_NAMES}
+    client = MongoClient(uri, **options)
+    try:
+        if target == "client":
+            receiver = client
+        elif target == "database":
+            receiver = client[data["database"]]
+        elif target == "collection":
+            receiver = client[data["database"]][data["collection"]]
+        else:
+            raise ValueError("Unknown operation target")
+        method = getattr(receiver, method_name)
+        if not callable(method):
+            raise ValueError("Requested member is not callable")
+        result = method(*(data.get("args") or []), **(data.get("kwargs") or {}))
+        if type(result).__name__ in ("Cursor", "CommandCursor", "RawBatchCursor", "SearchIndexCursor"):
+            cursor_options = data.get("cursor") or {}
+            for option, value in cursor_options.items():
+                if option in _CURSOR_OPTIONS and value is not None:
+                    getattr(result, option)(value)
+            result = list(result)
+        return _pack(result)
+    finally:
+        client.close()
 
 
 class handler(BaseHTTPRequestHandler):
     def _reply(self, status, value):
-        body = json_util.dumps(value).encode()
+        body = json_util.dumps(value).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -71,17 +102,14 @@ class handler(BaseHTTPRequestHandler):
         self._reply(200, {"service": "https-pymongo", "status": "ok"})
 
     def do_POST(self):
-        expected = os.environ.get("HTTPS_PYMONGO_API_KEY", "")
-        supplied = self.headers.get("Authorization", "")
-        if not expected or not hmac.compare_digest(supplied, "Bearer " + expected):
-            self._reply(401, {"error": "Unauthorized"}); return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length > 2_000_000: self._reply(413, {"error": "Request too large"}); return
+            if length <= 0 or length > _MAX_REQUEST_BYTES:
+                self._reply(413 if length > _MAX_REQUEST_BYTES else 400, {"error": "Invalid request size"})
+                return
             data = json_util.loads(self.rfile.read(length))
-            result = _run(data)
-            self._reply(200, {"ok": True, "result": result})
+            self._reply(200, {"ok": True, "result": _run(data)})
         except (KeyError, TypeError, ValueError) as exc:
-            self._reply(400, {"error": str(exc)})
+            self._reply(400, {"ok": False, "error": str(exc), "type": type(exc).__name__})
         except Exception as exc:
-            self._reply(502, {"error": str(exc), "type": type(exc).__name__})
+            self._reply(502, {"ok": False, "error": str(exc), "type": type(exc).__name__})
