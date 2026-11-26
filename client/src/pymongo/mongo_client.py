@@ -1,19 +1,22 @@
 """PyMongo-shaped synchronous client that sends database calls through HTTPS."""
 import os
-import urllib.error
-import urllib.request
 from urllib.parse import unquote, urlsplit
 
-from bson import json_util
-from .errors import ConfigurationError, OperationFailure
+import httpx
 
-_CURSOR_METHODS = {"find", "aggregate", "list_indexes", "list_search_indexes", "list_database_names_cursor"}
-_CLIENT_METHODS = {"list_database_names", "list_databases", "drop_database", "watch", "start_session", "server_info", "database_names"}
-_DATABASE_METHODS = {"command", "list_collection_names", "list_collections", "create_collection", "drop_collection", "dereference", "watch", "validate_collection", "create_view", "aggregate"}
+from bson import json_util
+from .errors import ConfigurationError, OperationFailure, UnsupportedOperation, ConnectionFailure
+
+_CURSOR_METHODS = {"find", "aggregate", "list_indexes", "list_search_indexes", "find_raw_batches", "aggregate_raw_batches"}
+_CLIENT_CURSOR_METHODS = {"list_databases"}
+_CLIENT_METHODS = {"list_database_names", "list_databases", "drop_database", "watch", "start_session", "server_info", "bulk_write", "append_metadata"}
+_DATABASE_CURSOR_METHODS = {"aggregate", "list_collections"}
+_DATABASE_METHODS = {"command", "list_collection_names", "list_collections", "create_collection", "drop_collection", "dereference", "watch", "validate_collection", "aggregate", "cursor_command", "with_options"}
 _CLIENT_OPTIONS = {
     "appname", "authsource", "authmechanism", "tls", "ssl", "replicaset", "directconnection",
     "serverselectiontimeoutms", "connecttimeoutms", "sockettimeoutms", "retrywrites",
-    "retryreads", "readpreference", "w", "wtimeoutms", "journal", "compressors",
+    "retryreads", "readpreference", "w", "wtimeoutms", "journal", "compressors", "maxpoolsize",
+    "minpoolsize", "maxidletimems", "maxconnecting", "waitqueuetimeoutms",
 }
 
 
@@ -36,6 +39,8 @@ class MongoClient:
         self._client_options = {k: v for k, v in kwargs.items() if k.lower() in _CLIENT_OPTIONS and isinstance(v, (str, int, float, bool, type(None), list, dict))}
         self.api_url = (api_url or os.getenv("HTTPS_PYMONGO_API_URL", "https://httpspymongo.vercel.app/api")).rstrip("/")
         self._closed = False
+        # One pooled transport per MongoClient; Motor's worker threads share it safely.
+        self._http = httpx.Client(timeout=60.0, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
 
     def __getitem__(self, name): return Database(self, str(name))
     def get_database(self, name=None, **kwargs):
@@ -49,7 +54,10 @@ class MongoClient:
         except ConfigurationError:
             if default is not None: return self[default]
             raise
-    def close(self): self._closed = True
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self._http.close()
     def __enter__(self): return self
     def __exit__(self, *exc): self.close()
 
@@ -62,31 +70,33 @@ class MongoClient:
             "client_options": self._client_options,
         }
         body = json_util.dumps(request_data).encode("utf-8")
-        req = urllib.request.Request(self.api_url, data=body, headers={"Content-Type": "application/json"}, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=60) as response:
-                envelope = json_util.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
+            response = self._http.post(self.api_url, content=body, headers={"Content-Type": "application/json"})
             try:
-                detail = json_util.loads(exc.read().decode("utf-8"))
-                message = detail.get("error", str(exc))
-                error_type = detail.get("type")
+                envelope = json_util.loads(response.content.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise OperationFailure(f"HTTPS bridge returned a non-JSON response (HTTP {response.status_code}); verify the API URL and deployment") from exc
+        except httpx.HTTPStatusError as exc:
+            response = exc.response
+            try:
+                detail = json_util.loads(response.content.decode("utf-8"))
             except Exception:
-                message, error_type = str(exc), None
-            from . import errors
-            error_class = getattr(errors, error_type or "", None)
-            if isinstance(error_class, type) and issubclass(error_class, Exception):
-                raise error_class(message) from exc
-            raise OperationFailure(message) from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
-            raise OperationFailure(f"HTTPS API request failed: {exc}") from exc
+                detail = {"error": f"HTTPS bridge returned HTTP {response.status_code}", "type": "OperationFailure"}
+            raise _remote_error(detail, response.status_code) from exc
+        except httpx.HTTPError as exc:
+            raise ConnectionFailure(f"HTTPS API transport failed ({type(exc).__name__}): {exc}", timeout=isinstance(exc, httpx.TimeoutException)) from exc
+        if response.is_error:
+            raise _remote_error(envelope, response.status_code)
         if not envelope.get("ok"):
-            raise OperationFailure(envelope.get("error", "API request failed"))
+            raise _remote_error(envelope, response.status_code)
         return _decode(envelope.get("result"), self)
 
     def __getattr__(self, method):
         if method.startswith("_"): raise AttributeError(method)
         if method in _CLIENT_METHODS:
+            if method in _CLIENT_CURSOR_METHODS:
+                def cursor(*args, **kwargs): return SyncCursor(self, method, args, kwargs)
+                return cursor
             def call(*args, **kwargs): return self._request("client", method=method, args=args, kwargs=kwargs)
             return call
         return self[method]
@@ -99,6 +109,7 @@ class Database:
     def __getattr__(self, method):
         if method.startswith("_"): raise AttributeError(method)
         if method in _DATABASE_METHODS:
+            if method in _DATABASE_CURSOR_METHODS: return SyncCursor(self, method, (), {})
             def call(*args, **kwargs): return self.client._request("database", self.name, method=method, args=args, kwargs=kwargs)
             return call
         return self[method]
@@ -120,8 +131,8 @@ class Collection:
 
 
 class SyncCursor:
-    def __init__(self, collection, method, args, kwargs):
-        self.collection, self.method = collection, method
+    def __init__(self, owner, method, args, kwargs):
+        self.owner, self.method = owner, method
         self.args, self.kwargs = args, dict(kwargs)
         self.options = {}
         self._items = None
@@ -138,30 +149,80 @@ class SyncCursor:
     def collation(self, value): return self._set("collation", value)
     def __iter__(self):
         if self._items is None:
-            self._items = self.collection._call(self.method, self.args, self.kwargs, self.options)
+            if isinstance(self.owner, Collection):
+                self._items = self.owner._call(self.method, self.args, self.kwargs, self.options)
+            elif isinstance(self.owner, Database):
+                self._items = self.owner.client._request("database", self.owner.name, method=self.method, args=self.args, kwargs=self.kwargs, cursor=self.options)
+            else:
+                self._items = self.owner._request("client", method=self.method, args=self.args, kwargs=self.kwargs, cursor=self.options)
         return iter(self._items)
     def __len__(self): return len(list(iter(self)))
     def __getitem__(self, index): return list(iter(self))[index]
     def rewind(self): self._items = None; return self
     def clone(self):
-        duplicate = SyncCursor(self.collection, self.method, self.args, self.kwargs)
+        duplicate = SyncCursor(self.owner, self.method, self.args, self.kwargs)
         duplicate.options = dict(self.options)
         return duplicate
     def to_list(self, length=None):
-        items = list(iter(self))
-        return items if length is None else items[:length]
+        if length is not None and (not isinstance(length, int) or length < 0):
+            raise ValueError("length must be a non-negative integer or None")
+        if length is None: return list(iter(self))
+        cursor = self.clone()
+        existing = cursor.options.get("limit")
+        cursor.limit(min(length, existing) if existing else length)
+        return list(iter(cursor))
 
 
 class _WriteResult:
     def __init__(self, value):
         self.raw_result = value
         for name, item in value.items(): setattr(self, name, item)
+    @property
+    def acknowledged(self): return bool(self.raw_result.get("ok", 1))
 
 
 class InsertOneResult(_WriteResult): pass
 class InsertManyResult(_WriteResult): pass
 class UpdateResult(_WriteResult): pass
 class DeleteResult(_WriteResult): pass
+class BulkWriteResult(_WriteResult):
+    @property
+    def acknowledged(self): return bool(self.raw_result.get("ok", 1))
+
+
+class ClientBulkWriteResult(BulkWriteResult):
+    @property
+    def has_verbose_results(self): return bool(self.raw_result.get("has_verbose_results", False))
+    @property
+    def insert_results(self): return self.raw_result.get("insert_results")
+    @property
+    def update_results(self): return self.raw_result.get("update_results")
+    @property
+    def delete_results(self): return self.raw_result.get("delete_results")
+
+
+def _remote_error(payload, status):
+    from . import errors
+    message = payload.get("error", "HTTPS bridge operation failed")
+    error_type = payload.get("type", "")
+    code = payload.get("code")
+    details = payload.get("details")
+    if error_type in {"UnsupportedMethodError", "UnsupportedOperation"}:
+        return UnsupportedOperation(message)
+    if status == 503 or error_type in {"ServerSelectionTimeoutError", "ConnectionFailure", "NetworkTimeout"}:
+        cls = getattr(errors, error_type, errors.ServerSelectionTimeoutError)
+        return cls(message, timeout=error_type == "NetworkTimeout")
+    if error_type == "DuplicateKeyError" or code == 11000:
+        return errors.DuplicateKeyError(message, code=code, details=details)
+    if error_type == "BulkWriteError":
+        return errors.BulkWriteError(message, details=details)
+    if error_type == "ConfigurationError":
+        return errors.ConfigurationError(message)
+    if error_type in {"WriteError", "WriteConcernError"}:
+        return getattr(errors, error_type)(message, code=code, details=details)
+    if status == 400 and error_type in {"ValueError", "TypeError", "KeyError"}:
+        return errors.InvalidOperation(message)
+    return errors.OperationFailure(message, code=code, details=details)
 
 
 def _decode(value, client=None):
@@ -173,7 +234,8 @@ def _decode(value, client=None):
         kind = value["__https_pymongo_result__"]
         payload = value.get("value", {})
         cls = {"InsertOneResult": InsertOneResult, "InsertManyResult": InsertManyResult,
-               "UpdateResult": UpdateResult, "DeleteResult": DeleteResult}.get(kind)
+               "UpdateResult": UpdateResult, "DeleteResult": DeleteResult,
+               "BulkWriteResult": BulkWriteResult, "ClientBulkWriteResult": ClientBulkWriteResult}.get(kind)
         if cls: return cls(payload)
     if isinstance(value, list): return [_decode(item, client) for item in value]
     if isinstance(value, dict): return {key: _decode(item, client) for key, item in value.items()}

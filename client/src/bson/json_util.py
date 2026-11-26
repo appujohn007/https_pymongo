@@ -8,6 +8,8 @@ from .objectid import ObjectId
 
 
 def _default(value):
+    encoder = getattr(value, "_https_pymongo_encode", None)
+    if callable(encoder): return encoder()
     if isinstance(value, ObjectId): return {"$oid": str(value)}
     if isinstance(value, datetime):
         dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)

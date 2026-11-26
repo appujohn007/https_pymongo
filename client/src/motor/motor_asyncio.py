@@ -1,7 +1,8 @@
 """Async Motor-shaped wrappers over the HTTPS PyMongo client."""
 import asyncio
 
-from pymongo.mongo_client import MongoClient, SyncCursor
+from pymongo.mongo_client import (MongoClient, SyncCursor, _CLIENT_CURSOR_METHODS,
+                                  _CURSOR_METHODS, _DATABASE_CURSOR_METHODS)
 
 
 class AsyncIOMotorClient:
@@ -15,8 +16,13 @@ class AsyncIOMotorClient:
     def get_default_database(self, default=None, **kwargs):
         return AsyncIOMotorDatabase(self._sync.get_default_database(default, **kwargs))
     def close(self): self._sync.close()
+    def __enter__(self): return self
+    def __exit__(self, *exc): self.close()
     def __getattr__(self, method):
         if method.startswith("_"): raise AttributeError(method)
+        if method in _CLIENT_CURSOR_METHODS:
+            def cursor(*args, **kwargs): return AsyncIOMotorCursor(getattr(self._sync, method)(*args, **kwargs))
+            return cursor
         async def call(*args, **kwargs): return await asyncio.to_thread(getattr(self._sync, method), *args, **kwargs)
         return call
 
@@ -27,6 +33,9 @@ class AsyncIOMotorDatabase:
     def get_collection(self, name, **kwargs): return self[name]
     def __getattr__(self, method):
         if method.startswith("_"): raise AttributeError(method)
+        if method in _DATABASE_CURSOR_METHODS:
+            def cursor(*args, **kwargs): return AsyncIOMotorCursor(getattr(self._sync, method)(*args, **kwargs))
+            return cursor
         async def call(*args, **kwargs): return await asyncio.to_thread(getattr(self._sync, method), *args, **kwargs)
         return call
 
@@ -39,6 +48,7 @@ class AsyncIOMotorCollection:
     def __getattr__(self, method):
         if method.startswith("_"): raise AttributeError(method)
         fn = getattr(self._sync, method)
+        if method in _CURSOR_METHODS: return AsyncIOMotorCursor(fn)
         async def call(*args, **kwargs): return await asyncio.to_thread(fn, *args, **kwargs)
         return call
 
@@ -52,9 +62,20 @@ class AsyncIOMotorCursor:
     def batch_size(self, size): return self._chain("batch_size", size)
     def hint(self, hint): return self._chain("hint", hint)
     def comment(self, comment): return self._chain("comment", comment)
+    def max_time_ms(self, value): return self._chain("max_time_ms", value)
+    def collation(self, value): return self._chain("collation", value)
+    def clone(self): return AsyncIOMotorCursor(self._cursor.clone())
+    def rewind(self): self._cursor.rewind(); self._items = None; self._position = 0; return self
     async def to_list(self, length=None):
+        if length is not None and (not isinstance(length, int) or length < 0):
+            raise ValueError("length must be a non-negative integer or None")
         if self._items is None:
-            self._items = await asyncio.to_thread(self._cursor.to_list)
+            cursor = self._cursor
+            if length is not None:
+                cursor = cursor.clone()
+                existing = cursor.options.get("limit")
+                cursor.limit(min(length, existing) if existing else length)
+            self._items = await asyncio.to_thread(cursor.to_list)
         return self._items if length is None else self._items[:length]
     def __aiter__(self): return self
     async def __anext__(self):
