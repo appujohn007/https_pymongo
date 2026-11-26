@@ -5,6 +5,7 @@ from pymongo.mongo_client import (MongoClient, Database as SyncDatabase,
                                   Collection as SyncCollection, SyncCursor,
                                   _CLIENT_CURSOR_METHODS, _CURSOR_METHODS,
                                   _DATABASE_CURSOR_METHODS)
+from pymongo.errors import UnsupportedOperation
 
 
 def _wrap(value):
@@ -24,6 +25,8 @@ class AsyncIOMotorClient:
         return AsyncIOMotorDatabase(self._sync.get_database(name, **kwargs))
     def get_default_database(self, default=None, **kwargs):
         return AsyncIOMotorDatabase(self._sync.get_default_database(default, **kwargs))
+    async def start_session(self, *args, **kwargs):
+        raise UnsupportedOperation("MongoDB sessions and transactions are not supported over the stateless HTTPS bridge")
     def close(self): self._sync.close()
     def __enter__(self): return self
     def __exit__(self, *exc): self.close()

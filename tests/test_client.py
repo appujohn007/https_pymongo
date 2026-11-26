@@ -139,6 +139,21 @@ def test_motor_database_attribute_access_resolves_collections(monkeypatch):
     assert captured[0]["method"] == "find_one"
 
 
+def test_pyrogram_type_only_pymongo_imports_are_available():
+    from bson.codec_options import CodecOptions
+    from pymongo.client_session import TransactionOptions
+    from pymongo.read_concern import ReadConcern
+    from pymongo.read_preferences import Nearest, Primary, PrimaryPreferred, Secondary, SecondaryPreferred
+    from pymongo.write_concern import WriteConcern
+    assert CodecOptions().document_class is dict
+    assert TransactionOptions().max_commit_time_ms is None
+    assert ReadConcern("majority").document == {"level": "majority"}
+    assert [Primary().mode, PrimaryPreferred().mode, Secondary().mode,
+            SecondaryPreferred().mode, Nearest().mode] == ["primary", "primaryPreferred", "secondary",
+                                                            "secondaryPreferred", "nearest"]
+    assert WriteConcern(w="majority").document == {"w": "majority"}
+
+
 def test_bridge_errors_map_to_informative_pymongo_errors():
     from pymongo.errors import DuplicateKeyError, UnsupportedOperation
     from pymongo.mongo_client import _remote_error
