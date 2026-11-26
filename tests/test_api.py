@@ -76,7 +76,9 @@ def test_pool_options_are_capped(monkeypatch):
     def fake_client(uri, **options):
         value=Client(uri, **options); created.append((value,options)); return value
     monkeypatch.setattr(index, "MongoClient", fake_client)
-    with index._client_lease("mongodb://pool.example",{"maxPoolSize":100,"minPoolSize":50}) as client:
+    with index._client_lease("mongodb://pool.example",{"maxPoolSize":100,"minPoolSize":50}) as lease:
+        client, cache_status = lease
+        assert cache_status == "miss"
         assert created[0][0] is client
         assert created[0][1]["maxPoolSize"] == 10
         assert created[0][1]["minPoolSize"] == 10
@@ -91,9 +93,11 @@ def test_cache_stays_bounded_when_all_entries_are_active(monkeypatch):
     def fake_client(uri, **options):
         value=Client(uri, **options); created.append(value); return value
     monkeypatch.setattr(index,"MongoClient",fake_client)
-    with index._client_lease("mongodb://one.example",{}):
-        with index._client_lease("mongodb://two.example",{}):
-            with index._client_lease("mongodb://three.example",{}) as transient:
+    with index._client_lease("mongodb://one.example",{}) as one:
+        with index._client_lease("mongodb://two.example",{}) as two:
+            with index._client_lease("mongodb://three.example",{}) as three:
+                transient, cache_status = three
+                assert cache_status == "transient"
                 assert len(index._CLIENT_CACHE) == 2
                 assert len(created) == 3
                 assert not transient.closed
@@ -117,13 +121,32 @@ def test_cursor_stops_before_building_oversized_response(monkeypatch):
 
 def test_public_post_needs_no_api_key(monkeypatch):
     monkeypatch.delenv("HTTPS_PYMONGO_API_KEY",raising=False)
-    monkeypatch.setattr(index,"_run",lambda request: {"ok":True})
+    monkeypatch.setattr(index,"_run",lambda request, metrics: {"ok":True})
     request=object.__new__(index.handler)
     request.headers={"Content-Length":"2"}; request.rfile=io.BytesIO(b"{}")
     request.wfile=io.BytesIO(); statuses=[]
     request.send_response=statuses.append; request.send_header=lambda *args:None; request.end_headers=lambda:None
     request.do_POST()
     assert statuses == [200]
+
+
+def test_metrics_are_structured_and_do_not_contain_uri(monkeypatch, capsys):
+    def fake_run(data, metrics):
+        metrics["client_cache"] = "hit"
+        metrics["db_call_ms"] = 1.2
+        metrics["documents"] = 3
+        return [{"ok":True}]
+    monkeypatch.setattr(index, "_run", fake_run)
+    request=object.__new__(index.handler)
+    request.headers={"Content-Length":"2"}; request.rfile=io.BytesIO(b"{}")
+    request.wfile=io.BytesIO(); request.send_response=lambda *args:None
+    request.send_header=lambda *args:None; request.end_headers=lambda:None
+    request.do_POST()
+    output=capsys.readouterr().out
+    assert '"client_cache":"hit"' in output
+    assert '"db_call_ms":1.2' in output
+    assert '"documents":3' in output
+    assert "mongodb://" not in output
 
 
 def test_oversized_response_returns_bounded_error(monkeypatch):
