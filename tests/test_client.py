@@ -154,6 +154,21 @@ def test_pyrogram_type_only_pymongo_imports_are_available():
     assert WriteConcern(w="majority").document == {"w": "majority"}
 
 
+def test_httpx_request_log_filter_only_hides_bridge_request_lines():
+    import logging
+    from pymongo.mongo_client import _BridgeHTTPXLogFilter, _HTTPX_LOG_CONTEXT
+    log_filter = _BridgeHTTPXLogFilter()
+    request = logging.LogRecord("httpx", logging.INFO, "", 0, "HTTP Request: POST https://bridge/api", (), None)
+    unrelated = logging.LogRecord("httpx", logging.WARNING, "", 0, "transport warning", (), None)
+    assert log_filter.filter(request)
+    _HTTPX_LOG_CONTEXT.active = True
+    try:
+        assert not log_filter.filter(request)
+        assert log_filter.filter(unrelated)
+    finally:
+        _HTTPX_LOG_CONTEXT.active = False
+
+
 def test_bridge_errors_map_to_informative_pymongo_errors():
     from pymongo.errors import DuplicateKeyError, UnsupportedOperation
     from pymongo.mongo_client import _remote_error

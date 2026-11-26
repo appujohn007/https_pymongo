@@ -56,6 +56,7 @@ asyncio.run(main())
 
 - The default API URL is `https://httpspymongo.vercel.app/api`.
 - Override it with `HTTPS_PYMONGO_API_URL` or `MongoClient(..., api_url="https://your-host/api")`.
+- Re-enable HTTPX's per-request log lines with `HTTPS_PYMONGO_HTTPX_LOGS=1`; by default the package filters only its own repetitive request lines and leaves warnings/errors visible.
 - Supply the MongoDB URI to `MongoClient` or `AsyncIOMotorClient` as usual. The package sends it to the API over HTTPS for each operation.
 - The API does not require an API key and does not use a server-side fixed MongoDB URI.
 

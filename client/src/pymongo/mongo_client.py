@@ -1,5 +1,7 @@
 """PyMongo-shaped synchronous client that sends database calls through HTTPS."""
 import os
+import logging
+import threading
 from urllib.parse import unquote, urlsplit
 
 import httpx
@@ -17,6 +19,23 @@ _RETRYABLE_READS = {
     "find", "find_one", "count_documents", "estimated_document_count", "distinct",
     "list_indexes", "list_search_indexes", "index_information", "options", "server_info",
 }
+_HTTPX_LOG_CONTEXT = threading.local()
+
+
+class _BridgeHTTPXLogFilter(logging.Filter):
+    """Hide only HTTPX request lines emitted while this package performs a call."""
+    def filter(self, record):
+        if (getattr(_HTTPX_LOG_CONTEXT, "active", False)
+                and record.name == "httpx"
+                and record.getMessage().startswith("HTTP Request:")):
+            return False
+        return True
+
+
+if os.getenv("HTTPS_PYMONGO_HTTPX_LOGS", "").lower() not in {"1", "true", "yes"}:
+    _httpx_logger = logging.getLogger("httpx")
+    if not any(isinstance(item, _BridgeHTTPXLogFilter) for item in _httpx_logger.filters):
+        _httpx_logger.addFilter(_BridgeHTTPXLogFilter())
 _CLIENT_OPTIONS = {
     "appname", "authsource", "authmechanism", "tls", "ssl", "replicaset", "directconnection",
     "serverselectiontimeoutms", "connecttimeoutms", "sockettimeoutms", "retrywrites",
@@ -79,7 +98,12 @@ class MongoClient:
         response = envelope = None
         for attempt in range(2 if can_retry_read else 1):
             try:
-                response = self._http.post(self.api_url, content=body, headers={"Content-Type": "application/json"})
+                previous_log_context = getattr(_HTTPX_LOG_CONTEXT, "active", False)
+                _HTTPX_LOG_CONTEXT.active = True
+                try:
+                    response = self._http.post(self.api_url, content=body, headers={"Content-Type": "application/json"})
+                finally:
+                    _HTTPX_LOG_CONTEXT.active = previous_log_context
             except (httpx.ReadError, httpx.RemoteProtocolError) as exc:
                 if can_retry_read and attempt == 0:
                     continue
