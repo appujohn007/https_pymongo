@@ -10,7 +10,10 @@ class AsyncIOMotorClient:
             host = kwargs.pop("uri")
         self._sync = MongoClient(host, port, **kwargs)
     def __getitem__(self, name): return AsyncIOMotorDatabase(self._sync[name])
-    def get_database(self, name="test", **kwargs): return self[name]
+    def get_database(self, name=None, **kwargs):
+        return AsyncIOMotorDatabase(self._sync.get_database(name, **kwargs))
+    def get_default_database(self, default=None, **kwargs):
+        return AsyncIOMotorDatabase(self._sync.get_default_database(default, **kwargs))
     def close(self): self._sync.close()
     def __getattr__(self, method):
         if method.startswith("_"): raise AttributeError(method)

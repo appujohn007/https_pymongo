@@ -1,4 +1,11 @@
 class PyMongoError(Exception): pass
 class ConfigurationError(PyMongoError): pass
 class OperationFailure(PyMongoError): pass
-class ServerSelectionTimeoutError(PyMongoError): pass
+class ConnectionFailure(PyMongoError): pass
+class ServerSelectionTimeoutError(ConnectionFailure): pass
+class NetworkTimeout(ConnectionFailure): pass
+class DuplicateKeyError(OperationFailure): pass
+class WriteError(OperationFailure): pass
+class WriteConcernError(OperationFailure): pass
+class BulkWriteError(OperationFailure): pass
+class InvalidOperation(PyMongoError): pass

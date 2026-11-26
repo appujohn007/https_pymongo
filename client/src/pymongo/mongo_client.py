@@ -2,13 +2,14 @@
 import os
 import urllib.error
 import urllib.request
+from urllib.parse import unquote, urlsplit
 
 from bson import json_util
 from .errors import ConfigurationError, OperationFailure
 
 _CURSOR_METHODS = {"find", "aggregate", "list_indexes", "list_search_indexes", "list_database_names_cursor"}
 _CLIENT_METHODS = {"list_database_names", "list_databases", "drop_database", "watch", "start_session", "server_info", "database_names"}
-_DATABASE_METHODS = {"command", "list_collection_names", "list_collections", "create_collection", "drop_collection", "dereference", "watch", "validate_collection", "create_view"}
+_DATABASE_METHODS = {"command", "list_collection_names", "list_collections", "create_collection", "drop_collection", "dereference", "watch", "validate_collection", "create_view", "aggregate"}
 _CLIENT_OPTIONS = {
     "appname", "authsource", "authmechanism", "tls", "ssl", "replicaset", "directconnection",
     "serverselectiontimeoutms", "connecttimeoutms", "sockettimeoutms", "retrywrites",
@@ -22,18 +23,32 @@ class MongoClient:
         if host is None and "uri" in kwargs:
             host = kwargs.pop("uri")
         if isinstance(host, (list, tuple)):
-            host = host[0] if host else None
+            host = ",".join(str(item) for item in host) if host else None
         if host is None:
-            host = "mongodb://localhost:27017"
+            host = f"mongodb://localhost:{port or 27017}"
         if isinstance(host, int):
             host = f"mongodb://localhost:{host}"
+        elif port is not None and isinstance(host, str) and not host.startswith(("mongodb://", "mongodb+srv://")):
+            host = f"mongodb://{host}:{port}"
+        elif isinstance(host, str) and not host.startswith(("mongodb://", "mongodb+srv://")):
+            host = f"mongodb://{host}"
         self._uri = str(host)
         self._client_options = {k: v for k, v in kwargs.items() if k.lower() in _CLIENT_OPTIONS and isinstance(v, (str, int, float, bool, type(None), list, dict))}
         self.api_url = (api_url or os.getenv("HTTPS_PYMONGO_API_URL", "https://httpspymongo.vercel.app/api")).rstrip("/")
         self._closed = False
 
     def __getitem__(self, name): return Database(self, str(name))
-    def get_database(self, name="test", **kwargs): return self[name]
+    def get_database(self, name=None, **kwargs):
+        if name is None:
+            path = urlsplit(self._uri).path.strip("/")
+            name = unquote(path.split("?", 1)[0]) if path else None
+        if not name: raise ConfigurationError("No default database is specified in the URI")
+        return self[name]
+    def get_default_database(self, default=None, **kwargs):
+        try: return self.get_database()
+        except ConfigurationError:
+            if default is not None: return self[default]
+            raise
     def close(self): self._closed = True
     def __enter__(self): return self
     def __exit__(self, *exc): self.close()
@@ -58,13 +73,16 @@ class MongoClient:
                 error_type = detail.get("type")
             except Exception:
                 message, error_type = str(exc), None
-            if error_type == "ConfigurationError": raise ConfigurationError(message) from exc
+            from . import errors
+            error_class = getattr(errors, error_type or "", None)
+            if isinstance(error_class, type) and issubclass(error_class, Exception):
+                raise error_class(message) from exc
             raise OperationFailure(message) from exc
         except (urllib.error.URLError, TimeoutError) as exc:
             raise OperationFailure(f"HTTPS API request failed: {exc}") from exc
         if not envelope.get("ok"):
             raise OperationFailure(envelope.get("error", "API request failed"))
-        return _decode(envelope.get("result"))
+        return _decode(envelope.get("result"), self)
 
     def __getattr__(self, method):
         if method.startswith("_"): raise AttributeError(method)
@@ -123,6 +141,12 @@ class SyncCursor:
             self._items = self.collection._call(self.method, self.args, self.kwargs, self.options)
         return iter(self._items)
     def __len__(self): return len(list(iter(self)))
+    def __getitem__(self, index): return list(iter(self))[index]
+    def rewind(self): self._items = None; return self
+    def clone(self):
+        duplicate = SyncCursor(self.collection, self.method, self.args, self.kwargs)
+        duplicate.options = dict(self.options)
+        return duplicate
     def to_list(self, length=None):
         items = list(iter(self))
         return items if length is None else items[:length]
@@ -140,13 +164,17 @@ class UpdateResult(_WriteResult): pass
 class DeleteResult(_WriteResult): pass
 
 
-def _decode(value):
+def _decode(value, client=None):
+    if isinstance(value, dict) and "__https_pymongo_object__" in value and client is not None:
+        kind = value["__https_pymongo_object__"]
+        if kind == "Database": return client[value["name"]]
+        if kind == "Collection": return client[value["database"]][value["name"]]
     if isinstance(value, dict) and "__https_pymongo_result__" in value:
         kind = value["__https_pymongo_result__"]
         payload = value.get("value", {})
         cls = {"InsertOneResult": InsertOneResult, "InsertManyResult": InsertManyResult,
                "UpdateResult": UpdateResult, "DeleteResult": DeleteResult}.get(kind)
         if cls: return cls(payload)
-    if isinstance(value, list): return [_decode(item) for item in value]
-    if isinstance(value, dict): return {key: _decode(item) for key, item in value.items()}
+    if isinstance(value, list): return [_decode(item, client) for item in value]
+    if isinstance(value, dict): return {key: _decode(item, client) for key, item in value.items()}
     return value
