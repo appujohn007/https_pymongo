@@ -219,9 +219,11 @@ def _pack(value, metrics=None):
             "UpdateResult": ("matched_count", "modified_count", "upserted_id", "raw_result"),
             "DeleteResult": ("deleted_count",),
         "BulkWriteResult": ("inserted_count", "matched_count", "modified_count", "deleted_count", "upserted_count", "upserted_ids", "bulk_api_result"),
-        "ClientBulkWriteResult": ("inserted_count", "matched_count", "modified_count", "deleted_count", "upserted_count", "bulk_api_result", "has_verbose_results", "insert_results", "update_results", "delete_results"),
+        "ClientBulkWriteResult": ("inserted_count", "matched_count", "modified_count", "deleted_count", "upserted_count", "bulk_api_result", "has_verbose_results"),
         }[name]
         payload = {field: getattr(value, field, None) for field in fields}
+        if name == "ClientBulkWriteResult" and payload.get("has_verbose_results"):
+            payload.update({field: getattr(value, field, None) for field in ("insert_results", "update_results", "delete_results")})
         return {"__https_pymongo_result__": result_types[name], "value": payload}
     if isinstance(value, tuple): return [_pack(item, metrics) for item in value]
     if isinstance(value, list): return [_pack(item, metrics) for item in value]
